@@ -17,13 +17,13 @@ The dashboard is designed with an extremely simple and clean UI, free of unneces
   - **Motion Sensor:** Shows the real-time state of the RCWL-0516 motion sensor.
   - **Lighting Output (PWM):** Displays the current Pulse Width Modulation value (0-255) sent to the lighting system.
   - **Safety Events:** A counter tracking how many times the system responded to motion in low-light conditions.
-- **Telemetry History Graph:** A time-series chart plotting both the ambient light and the lighting output, visually demonstrating the system's responsiveness to environmental changes.
+- **Telemetry History Graph:** A time-series chart for LDR, reference, sensor difference, LED duty/percent, daylight, and motion.
 - **Recent Event Log:** A live feed detailing the timestamps and descriptions of recent safety responses.
 
-## Mock Sensor Service
-Currently, the dashboard uses a **Mock Sensor Service** (`src/lib/mockSensorService.ts`) to simulate ESP32 hardware telemetry. 
-This decoupled service generates realistic data transitions (e.g., ramping up PWM when it gets dark and motion is detected). 
-In the future, this service will be replaced by a real cloud API or WebSocket connection without requiring any rewrites to the UI components.
+## Live Firebase Telemetry
+The dashboard polls `/api/sensors` every five seconds. The API reads the latest value from `streetlight/latest` and up to 120 records from `streetlight/history` in Firebase Realtime Database. Records use `ldr` (0-4095), `isDay` (boolean), `motion` (boolean or 0/1), `ledDuty` (0-255), and `ts` (epoch milliseconds). The dashboard uses `isDay` as the authoritative day/night state.
+
+The dashboard plots persisted history, with session-only samples as a fallback when there is just one reading. Older records using `pwm` and `timestamp` remain supported; LED percent is derived from PWM when omitted, and reference/difference remain unavailable unless provided.
 
 ## Tech Stack
 - Next.js (App Router)
@@ -79,5 +79,5 @@ npm run dev
 Open your browser (Chrome, Edge, Firefox) and go to:
 👉 **[http://localhost:3000](http://localhost:3000)**
 
-You should now see the live Smart Lighting Safety dashboard and interactive road simulation!
+You should now see the live Smart Lighting Safety dashboard and sensor-driven road view.
 

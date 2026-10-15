@@ -8,6 +8,7 @@ import {
   YAxis,
   CartesianGrid,
   Tooltip,
+  Legend,
   ResponsiveContainer,
 } from "recharts";
 import {
@@ -17,92 +18,231 @@ import {
   Moon,
   AlertTriangle,
   Wifi,
+  WifiOff,
   ShieldCheck,
   ShieldAlert,
 } from "lucide-react";
-import {
-  sensorService,
-  SensorDataExtended,
-  LOW_LIGHT_THRESHOLD,
-} from "@/lib/mockSensorService";
+import { LOW_LIGHT_THRESHOLD } from "@/lib/mockSensorService";
 import RoadSimulation from "./components/RoadSimulation";
 
-interface HistoryData extends SensorDataExtended {
+interface SensorReading {
+  deviceId: string;
+  timestamp: string;
+  motion: boolean;
+  isDay: boolean;
+  ldr: number;
+  ledDuty: number;
+  ledPercent: number;
+  diff: number | null;
+  ref: number | null;
+}
+
+interface HistoryData extends SensorReading {
   timeLabel: string;
+  daylightValue: number;
+  motionValue: number;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function toSensorReading(value: unknown): SensorReading | null {
+  if (!isRecord(value)) return null;
+
+  const ldr = Number(value.ldr);
+  const ledDuty = Number(value.ledDuty ?? value.pwm);
+  const ledPercent = Number(value.ledPercent ?? (ledDuty / 255) * 100);
+  const ref = value.ref == null ? null : Number(value.ref);
+  const diff = value.diff == null ? (ref === null ? null : ldr - ref) : Number(value.diff);
+  const motionValue = value.motion;
+  const motion = motionValue === true || motionValue === 1 || motionValue === "1";
+  const hasMotion = motionValue === false || motionValue === 0 || motionValue === "0" || motion;
+  const isDayValue = value.isDay;
+  const isDay = typeof isDayValue === "boolean"
+    ? isDayValue
+    : isDayValue === 1 || isDayValue === "1"
+      ? true
+      : isDayValue === 0 || isDayValue === "0"
+        ? false
+        : ldr >= LOW_LIGHT_THRESHOLD;
+
+  if (
+    !Number.isFinite(ldr) ||
+    !Number.isFinite(ledDuty) ||
+    !Number.isFinite(ledPercent) ||
+    (ref !== null && !Number.isFinite(ref)) ||
+    (diff !== null && !Number.isFinite(diff)) ||
+    !hasMotion
+  ) return null;
+
+  const timestampValue = value.timestamp ?? value.ts;
+  const parsedTimestamp = new Date(
+    typeof timestampValue === "string" || typeof timestampValue === "number"
+      ? timestampValue
+      : Date.now(),
+  );
+
+  return {
+    deviceId: typeof value.deviceId === "string" ? value.deviceId : "Streetlight",
+    timestamp: Number.isNaN(parsedTimestamp.getTime())
+      ? new Date().toISOString()
+      : parsedTimestamp.toISOString(),
+    motion,
+    isDay,
+    ldr,
+    ledDuty,
+    ledPercent,
+    diff,
+    ref,
+  };
+}
+
+function toHistoryRecord(reading: SensorReading): HistoryData {
+  return {
+    ...reading,
+    timeLabel: new Date(reading.timestamp).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    }),
+    daylightValue: reading.isDay ? 1 : 0,
+    motionValue: reading.motion ? 1 : 0,
+  };
 }
 
 export default function Dashboard() {
-  const [data, setData] = useState<SensorDataExtended | null>(null);
+  const [data, setData] = useState<SensorReading | null>(null);
   const [history, setHistory] = useState<HistoryData[]>([]);
-  const [motionEvents, setMotionEvents] = useState(0);
-  const [safetyEvents, setSafetyEvents] = useState(0); // low-light + motion events
-  const [recentEvents, setRecentEvents] = useState<
-    { id: string; time: string; description: string }[]
-  >([]);
+  const [isConnected, setIsConnected] = useState(false);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<string | null>(null);
 
   useEffect(() => {
-    sensorService.start(1000);
+    let cancelled = false;
 
-    let lastMotionState = false;
-    let localMotionEvents = 0;
-    let localSafetyEvents = 0;
+    const loadSensorData = async () => {
+      try {
+        const response = await fetch("/api/sensors", { cache: "no-store" });
+        if (!response.ok) throw new Error("Sensor API request failed");
 
-    const unsubscribe = sensorService.subscribe((newData) => {
-      setData(newData);
-
-      const timeLabel = new Date(newData.timestamp).toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-      });
-
-      setHistory((prev) => {
-        const newHistory = [...prev, { ...newData, timeLabel }];
-        if (newHistory.length > 30) newHistory.shift();
-        return newHistory;
-      });
-
-      // Track events
-      if (newData.motion && !lastMotionState) {
-        localMotionEvents++;
-        setMotionEvents(localMotionEvents);
-        
-        const isDark = newData.ldr < LOW_LIGHT_THRESHOLD;
-        if (isDark) {
-          localSafetyEvents++;
-          setSafetyEvents(localSafetyEvents);
-          setRecentEvents((prev) => {
-            const newEvents = [
-              {
-                id: Date.now().toString(),
-                time: timeLabel,
-                description: "Motion detected in low light. Lighting increased.",
-              },
-              ...prev,
-            ];
-            return newEvents.slice(0, 5); // Keep last 5
-          });
+        const result: unknown = await response.json();
+        if (!isRecord(result) || result.success !== true) {
+          throw new Error("Sensor API returned an unsuccessful response");
         }
+
+        const rawData = result.data;
+        let rawReadings: unknown[];
+        let rawLatest: unknown = null;
+
+        if (isRecord(rawData) && ("history" in rawData || "latest" in rawData)) {
+          const rawHistory = rawData.history;
+          rawReadings = Array.isArray(rawHistory)
+            ? rawHistory
+            : isRecord(rawHistory)
+              ? Object.values(rawHistory)
+              : [];
+          rawLatest = rawData.latest;
+        } else if (Array.isArray(rawData)) {
+          rawReadings = rawData;
+        } else if (isRecord(rawData) && toSensorReading(rawData)) {
+          rawReadings = [rawData];
+        } else {
+          rawReadings = isRecord(rawData) ? Object.values(rawData) : [];
+        }
+
+        const latestReading = toSensorReading(rawLatest);
+        const readingsByTimestamp = new Map(
+          rawReadings
+          .map(toSensorReading)
+            .filter((reading): reading is SensorReading => reading !== null)
+            .map((reading) => [reading.timestamp, reading]),
+        );
+        if (latestReading) readingsByTimestamp.set(latestReading.timestamp, latestReading);
+        const readings = Array.from(readingsByTimestamp.values())
+          .sort((first, second) => Date.parse(first.timestamp) - Date.parse(second.timestamp))
+          .slice(-120);
+
+        if (readings.length === 0) {
+          throw new Error("No valid sensor readings found in Firebase");
+        }
+
+        if (cancelled) return;
+
+        setData(latestReading ?? readings[readings.length - 1]);
+        setLastUpdated(new Date().toISOString());
+        setIsConnected(true);
+        setConnectionError(null);
+
+        setHistory((previous) => {
+          const mergedByTimestamp = new Map<string, HistoryData>();
+          previous.forEach((reading) => mergedByTimestamp.set(reading.timestamp, reading));
+          readings.forEach((reading) =>
+            mergedByTimestamp.set(reading.timestamp, toHistoryRecord(reading)),
+          );
+          return Array.from(mergedByTimestamp.values())
+            .sort((first, second) => Date.parse(first.timestamp) - Date.parse(second.timestamp))
+            .slice(-120);
+        });
+      } catch (error) {
+        if (cancelled) return;
+        setIsConnected(false);
+        setConnectionError(
+          error instanceof Error ? error.message : "Unable to load sensor data",
+        );
       }
-      lastMotionState = newData.motion;
-    });
+    };
+
+    let pollTimeout: number | undefined;
+    const poll = async () => {
+      await loadSensorData();
+      if (!cancelled) pollTimeout = window.setTimeout(() => void poll(), 1000);
+    };
+    void poll();
 
     return () => {
-      unsubscribe();
-      sensorService.stop();
+      cancelled = true;
+      if (pollTimeout !== undefined) window.clearTimeout(pollTimeout);
     };
   }, []);
 
   if (!data) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-500">
-        Connecting to sensor network...
+      <div className="min-h-screen flex flex-col items-center justify-center gap-2 bg-slate-50 text-slate-500">
+        <span>{connectionError ?? "Connecting to sensor network..."}</span>
+        {connectionError && <span className="text-xs">Retrying automatically.</span>}
       </div>
     );
   }
 
-  const isDark = data.ldr < LOW_LIGHT_THRESHOLD;
+  const isDark = !data.isDay;
   const isSafetyActive = isDark && data.motion;
+  const motionEvents = history.filter(
+    (reading, index) => reading.motion && !history[index - 1]?.motion,
+  ).length;
+  const safetyEvents = history.filter(
+    (reading, index) =>
+      reading.motion &&
+      !history[index - 1]?.motion &&
+      !reading.isDay,
+  ).length;
+  const recentEvents = history
+    .flatMap((reading, index) => {
+      if (
+        reading.motion &&
+        !history[index - 1]?.motion &&
+        !reading.isDay
+      ) {
+        return [{
+          id: `${reading.timestamp}-${index}`,
+          time: reading.timeLabel,
+          description: "Motion detected in low light. Lighting increased.",
+        }];
+      }
+      return [];
+    })
+    .reverse()
+    .slice(0, 5);
   
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 p-6 font-sans">
@@ -112,31 +252,40 @@ export default function Dashboard() {
         <header className="flex justify-between items-end border-b border-slate-200 pb-4">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Smart Lighting Safety</h1>
-            <p className="text-sm text-slate-500 mt-1">IoT Monitoring Dashboard — Live Simulation</p>
+            <p className="text-sm text-slate-500 mt-1">IoT Monitoring Dashboard — Live Telemetry</p>
           </div>
           <div className="flex items-center space-x-2 text-sm">
-            <Wifi className="w-4 h-4 text-emerald-600" />
-            <span className="text-emerald-700 font-medium">{data.deviceId} Online</span>
+            {isConnected ? (
+              <Wifi className="w-4 h-4 text-emerald-600" />
+            ) : (
+              <WifiOff className="w-4 h-4 text-rose-600" />
+            )}
+            <span className={`font-medium ${isConnected ? "text-emerald-700" : "text-rose-700"}`}>
+              {data.deviceId} {isConnected ? "Online" : "Connection lost"}
+            </span>
           </div>
         </header>
 
         {/* === Road Simulation === */}
         <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
           <div className="px-4 pt-3 pb-2 flex items-center justify-between">
-            <h2 className="text-sm font-medium text-slate-700">Live Road Simulation</h2>
+            <h2 className="text-sm font-medium text-slate-700">Live Road View</h2>
             <span className="text-xs text-slate-400 font-mono">
-              Cycle: {data.tick + 1}/{data.totalTicks} · ~15s loop
+              Updated {lastUpdated ? new Date(lastUpdated).toLocaleTimeString() : "--"}
             </span>
           </div>
           <RoadSimulation
-            phase={data.phase}
-            ldr={data.ldr}
-            pwm={data.pwm}
+            isDay={data.isDay}
+            pwm={data.ledDuty}
             motion={data.motion}
-            tick={data.tick}
-            totalTicks={data.totalTicks}
           />
         </div>
+
+        {connectionError && (
+          <div role="status" className="border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
+            Live sensor update failed: {connectionError}. Retrying automatically.
+          </div>
+        )}
 
         {/* Top Status Banner */}
         <div className={`p-4 border rounded-md flex items-center justify-between ${
@@ -164,7 +313,7 @@ export default function Dashboard() {
         </div>
 
         {/* Grid Stats */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           
           <div className="bg-white p-4 border border-slate-200 rounded-md">
             <div className="flex items-center justify-between mb-2 text-slate-500">
@@ -173,7 +322,7 @@ export default function Dashboard() {
             </div>
             <div className="text-2xl font-semibold">{data.ldr}</div>
             <div className="text-xs text-slate-500 mt-1">
-              ADC Value (Threshold: {LOW_LIGHT_THRESHOLD})
+              ADC Value (0-4095)
             </div>
           </div>
 
@@ -193,12 +342,30 @@ export default function Dashboard() {
           <div className="bg-white p-4 border border-slate-200 rounded-md">
             <div className="flex items-center justify-between mb-2 text-slate-500">
               <span className="text-sm font-medium">Lighting Output</span>
-              <Lightbulb className={`w-4 h-4 ${data.pwm > 0 ? "text-amber-500" : ""}`} />
+              <Lightbulb className={`w-4 h-4 ${data.ledDuty > 0 ? "text-amber-500" : ""}`} />
             </div>
-            <div className="text-2xl font-semibold">{data.pwm}</div>
+            <div className="text-2xl font-semibold">{data.ledDuty}</div>
             <div className="text-xs text-slate-500 mt-1">
-              PWM Value (0-255)
+              LED duty · {data.ledPercent}%
             </div>
+          </div>
+
+          <div className="bg-white p-4 border border-slate-200 rounded-md">
+            <div className="flex items-center justify-between mb-2 text-slate-500">
+              <span className="text-sm font-medium">Sensor Difference</span>
+              <Activity className="w-4 h-4" />
+            </div>
+            <div className="text-2xl font-semibold">{data.diff ?? "N/A"}</div>
+            <div className="text-xs text-slate-500 mt-1">LDR difference from reference</div>
+          </div>
+
+          <div className="bg-white p-4 border border-slate-200 rounded-md">
+            <div className="flex items-center justify-between mb-2 text-slate-500">
+              <span className="text-sm font-medium">Reference Level</span>
+              <Sun className="w-4 h-4" />
+            </div>
+            <div className="text-2xl font-semibold">{data.ref ?? "N/A"}</div>
+            <div className="text-xs text-slate-500 mt-1">ADC reference value</div>
           </div>
 
           <div className="bg-white p-4 border border-slate-200 rounded-md">
@@ -233,7 +400,7 @@ export default function Dashboard() {
                   <YAxis 
                     yAxisId="left" 
                     tick={{ fontSize: 11, fill: '#64748b' }} 
-                    domain={[0, 1023]} 
+                    domain={[0, 4095]} 
                   />
                   <YAxis 
                     yAxisId="right" 
@@ -241,9 +408,13 @@ export default function Dashboard() {
                     tick={{ fontSize: 11, fill: '#64748b' }} 
                     domain={[0, 255]} 
                   />
+                  <YAxis yAxisId="difference" domain={[-4095, 4095]} hide />
+                  <YAxis yAxisId="percent" domain={[0, 100]} hide />
+                  <YAxis yAxisId="state" domain={[0, 1]} hide />
                   <Tooltip 
                     contentStyle={{ borderRadius: '4px', border: '1px solid #cbd5e1', fontSize: '12px' }}
                   />
+                  <Legend wrapperStyle={{ fontSize: '11px' }} />
                   <Line 
                     yAxisId="left" 
                     type="stepAfter" 
@@ -253,14 +424,60 @@ export default function Dashboard() {
                     dot={false} 
                     name="Ambient Light (LDR)"
                   />
+                  <Line
+                    yAxisId="left"
+                    type="monotone"
+                    dataKey="ref"
+                    stroke="#0ea5e9"
+                    strokeWidth={1.5}
+                    strokeDasharray="5 4"
+                    dot={false}
+                    name="Reference"
+                  />
+                  <Line
+                    yAxisId="difference"
+                    type="monotone"
+                    dataKey="diff"
+                    stroke="#ef4444"
+                    strokeWidth={1.5}
+                    dot={false}
+                    name="Difference"
+                  />
                   <Line 
                     yAxisId="right" 
                     type="monotone" 
-                    dataKey="pwm" 
+                    dataKey="ledDuty" 
                     stroke="#eab308" 
                     strokeWidth={2} 
                     dot={false} 
-                    name="Lighting Output (PWM)"
+                    name="LED Duty"
+                  />
+                  <Line
+                    yAxisId="percent"
+                    type="monotone"
+                    dataKey="ledPercent"
+                    stroke="#10b981"
+                    strokeWidth={1.5}
+                    dot={false}
+                    name="LED Percent"
+                  />
+                  <Line
+                    yAxisId="state"
+                    type="stepAfter"
+                    dataKey="daylightValue"
+                    stroke="#6366f1"
+                    strokeWidth={1.5}
+                    dot={false}
+                    name="Daylight (1=day)"
+                  />
+                  <Line
+                    yAxisId="state"
+                    type="stepAfter"
+                    dataKey="motionValue"
+                    stroke="#ec4899"
+                    strokeWidth={1.5}
+                    dot={false}
+                    name="Motion (1=active)"
                   />
                 </LineChart>
               </ResponsiveContainer>

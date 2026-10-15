@@ -3,12 +3,14 @@
 import { PhaseLabel } from "@/lib/mockSensorService";
 
 interface RoadSimulationProps {
-  phase: PhaseLabel;
-  ldr: number;
+  isDay: boolean;
   pwm: number;
   motion: boolean;
-  tick: number;
-  totalTicks: number;
+}
+
+function getPhase(isDay: boolean, motion: boolean): PhaseLabel {
+  if (!isDay) return motion ? "night-motion" : "night";
+  return "day";
 }
 
 /**
@@ -19,15 +21,14 @@ interface RoadSimulationProps {
  * - A vehicle (car silhouette) and/or person that appear during "night-motion" ticks
  */
 export default function RoadSimulation({
-  phase,
   pwm,
+  isDay,
   motion,
-  tick,
-  totalTicks,
 }: RoadSimulationProps) {
   // --- derive visual parameters ---
   const lightBrightness = pwm / 255; // 0..1
   const lightOn = pwm > 5;
+  const phase = getPhase(isDay, motion);
 
   // Sky gradient per phase
   const skyGradient: Record<PhaseLabel, string> = {
@@ -56,9 +57,6 @@ export default function RoadSimulation({
     "night-motion": "🚗  Night — Vehicle Detected!",
     dawn:           "🌅  Dawn — Getting Bright",
   };
-
-  // Progress bar width
-  const progress = ((tick + 1) / totalTicks) * 100;
 
   return (
     <div
@@ -93,7 +91,7 @@ export default function RoadSimulation({
                 height: i % 3 === 0 ? "3px" : "2px",
                 borderRadius: "50%",
                 background: "white",
-                opacity: 0.4 + Math.random() * 0.5,
+                opacity: 0.4 + (i % 4) * 0.15,
                 left: `${(i * 37 + 11) % 100}%`,
                 top: `${(i * 23 + 7) % 50}%`,
                 animation: `twinkle ${1.5 + (i % 3) * 0.5}s ease-in-out infinite alternate`,
@@ -555,29 +553,6 @@ export default function RoadSimulation({
             Light: {lightOn ? `ON (${Math.round(lightBrightness * 100)}%)` : "OFF"}
           </span>
         </div>
-      </div>
-
-      {/* === Progress bar at bottom === */}
-      <div
-        style={{
-          position: "absolute",
-          bottom: 0,
-          left: 0,
-          right: 0,
-          height: "4px",
-          background: "rgba(0,0,0,0.3)",
-          zIndex: 20,
-        }}
-      >
-        <div
-          style={{
-            height: "100%",
-            width: `${progress}%`,
-            background: "linear-gradient(90deg, #f5a623, #e8739e, #56a0ee)",
-            transition: "width 0.8s ease",
-            borderRadius: "0 2px 2px 0",
-          }}
-        />
       </div>
 
       {/* === Motion badge === */}
